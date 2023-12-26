@@ -1,0 +1,283 @@
+---
+title: "UChi MS-ADS Whole Code"
+author: "Yiduan Zheng"
+date: "2023-12-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Original Prompt (Econometrics Problem Set)
+
+This problem is about ``Do College Graduates Serving as Village Officials Help Rural China?'' by Guojun He and Shaoda Wang, published in American Economic Journal: Applied Economics in 2017 (He and Wang (2017)). Try to reproduce Figure 2 of the paper. Then, produce a version of Figure 2 that uses the imputation procedure. Discuss the extent to which the two versions agree and differ in their substantive conclusions.
+
+```{r}
+## load libraries here
+library(pacman)
+p_load(ggplot2, dplyr, magrittr, sandwich, stats, car, lmtest, haven, ivreg, 
+       MASS, ivmte, ggpubr, stargazer, tidyverse, tidyr, broom, xtable)
+       
+rm(list = ls())
+```
+
+```{r}
+hewang <- read.csv("hewang2017.csv")
+View(hewang)
+```
+
+```{r}
+# step 0: generate event time
+hewang.cal <- hewang %>%
+  group_by(village) %>%
+  mutate(tyear = year[which(cgvo == 1)[1]]) %>%
+  replace_na(list(tyear = Inf))
+```
+
+```{r}
+# step 1: generate relative time
+hewang.rel <- hewang.cal %>%
+  mutate(relyear = year - tyear,
+         relyear = replace(relyear, relyear <= -4, -4),
+         relyear = replace(relyear, relyear >= 3, 3))
+```
+
+```{r}
+# step 2: convert to factors and relevel to -1
+hewang.rel %<>% 
+  mutate(relyear.num = relyear,
+         relyear = as.factor(relyear),
+         relyear = fct_relevel(relyear, "-1"))
+```
+
+```{r}
+# note: village 28 is an always-treated village and thus should not be included
+# I have filtered it out for this purpose
+# to better align with the original, just use hewang.rel
+hewang.rel.alt <- hewang.rel %>% filter(village != 28)
+```
+
+```{r}
+# set up vectors here
+Y <- c("l_subsidy_rate", "l_poor_housing_rate", 
+       "l_poor_reg_rate", "l_disability_rate")
+
+title.letter.lab <- c("A", "B", "C", "D")
+title.lab <- c("subsidized population", "poor-quality housing", 
+               "registered poor households", "people with disabilities")
+x.lab <- c("<= -4", "-3", "-2", "", "0", "1", "2", ">= 3")
+```
+
+```{r}
+fstat <- c()
+plot <- list()
+table <- list()
+```
+
+```{r}
+# this is recovering the original table
+
+for (i in 1:4) {
+  # run the regression
+  fmla.ori <- formula(paste0(Y[i]," ~
+       as.factor(village) + as.factor(year) + relyear"))
+  
+  lr.ori <- lm(data = hewang.rel.alt, fmla.ori)
+  
+  ftest <- (names(lr.ori$coeff) %in% paste0("relyear", -4:-2))
+  vc <- vcovCL(lr.ori, cluster = ~district, type ="HC0")
+  fstat[i] <- linearHypothesis(lr.ori, ftest, vcov. = vc)[2,"Pr(>F)"]
+  
+  # get cluster SE and filter
+  plotdf <- lr.ori %>%
+    tidy() %>%
+    mutate(std.error = sqrt(diag(vc))) %>%
+    filter(str_detect(term, "relyear")) %>%
+    mutate(term = as.numeric(str_replace(term, "relyear", ""))) 
+     
+  # third, save table
+  table[[i]] <- plotdf
+  
+  # last, we plot
+  plot[[i]] <- 
+    ggplot(data = plotdf, aes(x = term, y = estimate, 
+                              ymin = estimate - qnorm(0.95)*std.error, 
+                              ymax = estimate + qnorm(0.95)*std.error)) +
+    theme_bw() +
+    geom_point(shape = 23, size = 3) +
+    geom_errorbar() +
+    geom_hline(aes(yintercept = 0), linetype = 5) +
+    geom_vline(aes(xintercept = -1), linetype = 5) +
+    scale_x_continuous(
+      breaks = min(plotdf$term):max(plotdf$term),
+      labels = x.lab) +
+    labs(x = "Relative Time", 
+         y = "Estimated Coefficients",
+         title = paste0("Panel ", title.letter.lab[i], 
+                        ". Effect on ", title.lab[i]))
+  
+}
+
+fstat
+# [1] 0.25478749 0.84897316 0.80318982 0.08530861
+# all are insignificant at 5%
+```
+
+```{r}
+# original graph
+ggarrange(plot[[1]], plot[[2]], plot[[3]], plot[[4]], ncol = 2, nrow = 2)
+```
+
+```{r}
+# now we start imputing
+# first create the reltime.pos variable and adjust others
+hewang.rel.alt %<>% mutate(
+  relyear.pos = ifelse(relyear.num >= 0, relyear.num, -1),
+  relyear.pos = as.factor(relyear.pos),
+  year.num = year,
+  year = as.factor(year),
+  year = fct_relevel(year, "2000"),
+  tyear.num = tyear,
+  tyear = as.factor(tyear),
+  tyear = fct_relevel(tyear, "Inf")
+)
+```
+
+```{r}
+# cancel the group effect from previous code
+hewang.rel.alt %<>% ungroup()
+```
+
+```{r}
+# imputation function
+# code partially borrowed from lecture notes
+imputation <- function(data.in, Y) {
+    # the data is structured such as some variables are consistently uncollected 
+    # for some years, so restrict dataframe to avoid errors
+    data.temp <- data.in %>% filter(!is.na(!!sym(Y))) 
+    fmla1 <- formula(paste0(Y, " ~ year + tyear"))
+    
+    # Step one
+    lr.imp <- lm(data = data.temp %>% filter(relyear.num < 0), fmla1)
+    if (Y == "l_disability_rate"){
+      # this is the only always-treated unit after filtering for disability rate
+      data.temp %<>% filter(village != 176)
+    }
+    
+    # Step two
+    data.temp %>% 
+      mutate(y.imp := !!sym(Y) - predict(lr.imp, newdata = data.temp)) %>%
+      lm(formula = y.imp ~ relyear.pos)
+}
+```
+
+```{r}
+# Bootstrap the post-period
+villages <- unique(hewang.rel.alt$village)
+nv <- length(villages)
+nbs <- 100
+```
+
+```{r}
+# bootstrap
+impute.bs.se <- function(Y, nbs = 500){
+  bs.out <- vector(mode = "list", length = nbs)
+  
+  for (i in 1:nbs) { # cluster bootstrap
+    sample(villages, nv, replace = TRUE) %>%
+      lapply(function(v) hewang.rel.alt %>% 
+               filter(village == v)) %>%
+      bind_rows() %>%
+      imputation(., Y) %>%
+      tidy() %>%
+      pull("estimate", name = term)-> bs.out[[i]]
+  }
+  bs <- simplify2array(bs.out)
+  bs <- bs - rowMeans(bs)
+  bs <- t(bs)
+  vc <- (1 / nbs) * (t(bs) %*% bs) 
+  bs.se <- sqrt(diag(vc))
+  return(bs.se)
+}
+```
+
+```{r}
+table.imp <- list()
+plot.imp <- list()
+```
+
+```{r}
+# readjust, since the factor seems to cancel out somewhere
+hewang.rel.alt %<>% mutate(relyear = as.factor(relyear))
+```
+
+```{r}
+for (i in 1:length(Y)){
+  data.temp <- hewang.rel.alt %>% filter(!is.na(!!sym(Y[i]))) 
+  
+  fmla1 <- formula(paste0(Y[i], " ~ year + tyear + relyear"))
+  lr <- lm(data = data.temp %>% filter(relyear.num < 0), fmla1)
+
+  lr %>%
+  tidy() %>%
+  filter(!is.na(estimate)) %>%
+  mutate(std.error = sqrt(diag(vcovCL(lr, cluster = ~district, type ="HC0")))) %>%
+  bind_rows(., hewang.rel.alt %>% 
+              imputation(Y[i]) %>% 
+              tidy() %>% 
+              mutate(std.error = impute.bs.se(Y = Y[i]))) %>%
+  filter(str_detect(term, "relyear")) %>%
+  mutate(
+    relyear = str_replace(term, "relyear", ""),
+    relyear = str_replace(relyear, ".pos", ""),
+    relyear = as.numeric(relyear),
+    cilb = estimate - qnorm(0.95) * std.error,
+    ciub = estimate + qnorm(0.95) * std.error
+  ) -> lr.df
+
+  # save table
+  table.imp[[i]] <- lr.df
+  
+  # save plot
+  plot.imp[[i]] <- 
+    ggplot(data = lr.df, aes(x = relyear, y = estimate, 
+                             ymin = cilb, ymax = ciub)) +
+    theme_bw() +
+    geom_point(shape = 1, size = 3) +
+    geom_errorbar() +
+    geom_hline(aes(yintercept = 0), linetype = 5) +
+    geom_vline(aes(xintercept = -1), linetype = 5) +
+    scale_x_continuous(
+      breaks = min(lr.df$relyear):max(lr.df$relyear),
+      labels = x.lab) +
+    labs(x = "Relative Time", 
+         y = "Estimated Coefficients",
+         title = paste0("Panel ", title.letter.lab[i], 
+                        ". Effect on ", title.lab[i]))
+}
+```
+
+```{r}
+# imputed graph
+ggarrange(plot.imp[[1]], plot.imp[[2]], plot.imp[[3]], plot.imp[[4]], ncol = 2, nrow = 2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
